@@ -2,6 +2,13 @@ name: Build APK
 
 # 出包线：手动触发 + 推 v* 标签时触发（构建并发布 Release）。
 # 与仓库自带的 android.yml（push 触发的 debug 测试线）互不冲突。
+#
+# 2026-10-28 修复：上游 fetch-deps.sh 依赖的 MNN 预编译包
+# （WWRJ3321/IRIDIS v2.0.0-beta Release 的 mnn-prebuilt-arm64.tar.gz）已被作者删除，
+# 公开渠道无镜像（Releases API / Wayback 均已核实），导致 curl 404 / exit 22。
+# 处理：full flavor 改走脚本自带的 --build-mnn 从源码重建（同 pinned commit + 补丁，
+# 约 15-30 分钟，产物 third_party/mnn 进 actions/cache，后续构建零成本）；
+# lite flavor 不链接 MNN（IRIS_MNN 仅 full 开启），冷缓存时直接剥离该下载块。
 
 on:
   workflow_dispatch:
@@ -29,7 +36,7 @@ jobs:
   build:
     name: Release APK (${{ inputs.flavor || 'both' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,11 +48,12 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Install SDK components (platform-35 / build-tools / NDK r27c / CMake)
+      - name: Install SDK components (platform-35 / build-tools / NDK r27c+r30 / CMake / ninja)
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-35" "build-tools;35.0.0" \
-            "ndk;27.2.12479018" "cmake;3.22.1" > /dev/null
+            "ndk;27.2.12479018" "ndk;30.0.16248370" "cmake;3.22.1" > /dev/null
 
       - name: Cache pinned native deps (llama.cpp / MNN / QNN headers / sherpa AAR)
         uses: actions/cache@v4
@@ -55,8 +63,32 @@ jobs:
             app/libs
           key: native-deps-${{ hashFiles('scripts/fetch-deps.sh') }}
 
-      - name: Fetch pinned native deps
-        run: sh scripts/fetch-deps.sh
+      - name: Fetch pinned native deps (MNN source rebuild, upstream asset deleted)
+        run: |
+          FLAVOR="${{ inputs.flavor || 'both' }}"
+          MNN_COMMIT="$(sed -n 's/^MNN_COMMIT="\(.*\)"$/\1/p' scripts/fetch-deps.sh | head -1)"
+          if [ -f third_party/mnn/lib/arm64-v8a/libMNN.a ] && grep -q "$MNN_COMMIT" third_party/mnn/VERSION 2>/dev/null; then
+            echo "MNN: present (cache)"
+            sh scripts/fetch-deps.sh
+          elif [ "$FLAVOR" != "lite" ]; then
+            echo "MNN: 上游预编译包已 404，从源码重建（pinned $MNN_COMMIT，首次约 15-30 分钟）"
+            echo "- MNN：源码重建（上游 v2.0.0-beta Release 资产已被删除）" >> "$GITHUB_STEP_SUMMARY"
+            NDK="$ANDROID_HOME/ndk/30.0.16248370" sh scripts/fetch-deps.sh --build-mnn
+            rm -rf build/mnn-src build/mnn-android   # 省磁盘：缓存只保留 third_party/mnn 产物
+          else
+            echo "MNN: lite 不链接 MNN（IRIS_MNN 仅 full flavor 开启），跳过"
+            sed -i '/^# ---- MNN prebuilt/,/^# ---- QNN C API/{/^# ---- QNN C API/!d}' scripts/fetch-deps.sh
+            sh -n scripts/fetch-deps.sh || { echo "fetch-deps.sh 结构已变化，需复查 MNN 跳过补丁" >&2; exit 1; }
+            sh scripts/fetch-deps.sh
+          fi
+          # 关键产物断言：fetch 环节任何异常在这里显式失败，而不是拖到 gradle 里报模糊错误
+          [ -f third_party/llama.cpp/CMakeLists.txt ] || { echo "assert fail: llama.cpp 缺失" >&2; exit 1; }
+          ls app/libs/sherpa-onnx-*.aar > /dev/null 2>&1 || { echo "assert fail: sherpa AAR 缺失" >&2; exit 1; }
+          [ -f third_party/qnn-api/include/QnnInterface.h ] || { echo "assert fail: QNN 头文件缺失" >&2; exit 1; }
+          if [ "$FLAVOR" != "lite" ]; then
+            [ -f third_party/mnn/lib/arm64-v8a/libMNN.a ] || { echo "assert fail: MNN lib 缺失" >&2; exit 1; }
+          fi
+          echo "native deps OK"
 
       # app/build.gradle.kts 只认项目根目录的 keystore.properties：
       #   - 配置了 4 个 secrets -> 用正式密钥签名（可覆盖安装此前发布的正式包）
