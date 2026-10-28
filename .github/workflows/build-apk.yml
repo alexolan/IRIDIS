@@ -1,0 +1,156 @@
+name: Build APK
+
+# 出包线：手动触发 + 推 v* 标签时触发（构建并发布 Release）。
+# 与仓库自带的 android.yml（push 触发的 debug 测试线）互不冲突。
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: '构建哪个 flavor（lite=仅 llama.cpp / full=+LiteRT-LM+MNN+GenieX）'
+        type: choice
+        options:
+          - both
+          - lite
+          - full
+        default: both
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # tag 构建时创建 Release 并上传 APK
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Release APK (${{ inputs.flavor || 'both' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Install SDK components (platform-35 / build-tools / NDK r27c / CMake)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-35" "build-tools;35.0.0" \
+            "ndk;27.2.12479018" "cmake;3.22.1" > /dev/null
+
+      - name: Cache pinned native deps (llama.cpp / MNN / QNN headers / sherpa AAR)
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party
+            app/libs
+          key: native-deps-${{ hashFiles('scripts/fetch-deps.sh') }}
+
+      - name: Fetch pinned native deps
+        run: sh scripts/fetch-deps.sh
+
+      # app/build.gradle.kts 只认项目根目录的 keystore.properties：
+      #   - 配置了 4 个 secrets -> 用正式密钥签名（可覆盖安装此前发布的正式包）
+      #   - 未配置 -> 生成一次性 debug 密钥签名，保证 APK 可直接安装（但每次 run 的签名不同，不可互相覆盖）
+      - name: Set up signing (release keystore if configured, else CI debug key)
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            printf '%s' '${{ secrets.ANDROID_KEYSTORE_BASE64 }}' | base64 -d > release.keystore
+            cat > keystore.properties <<'EOF'
+          storeFile=release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+            echo "SIGN_MODE=release" >> "$GITHUB_ENV"
+          else
+            KS="$HOME/.android/debug.keystore"
+            mkdir -p "$(dirname "$KS")"
+            keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            cat > keystore.properties <<EOF
+          storeFile=$KS
+          storePassword=android
+          keyAlias=androiddebugkey
+          keyPassword=android
+          EOF
+            echo "SIGN_MODE=debug" >> "$GITHUB_ENV"
+          fi
+
+      # 跳过 lintVital：lite 的 release lint 从未被上游 CI 验证过（android.yml 只跑
+      # lintFullDebug），出包线以稳定产出 APK 为先；lint 质量门交给 android.yml。
+      - name: Build release APK(s)
+        run: |
+          FLAVOR="${{ inputs.flavor || 'both' }}"
+          case "$FLAVOR" in
+            lite) TASKS="assembleLiteRelease" ;;
+            full) TASKS="assembleFullRelease" ;;
+            *)    TASKS="assembleLiteRelease assembleFullRelease" ;;
+          esac
+          echo "Building: $TASKS"
+          ./gradlew $TASKS --no-daemon \
+            -x lintVitalLiteRelease -x lintVitalFullRelease
+
+      - name: Collect and rename APKs
+        run: |
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p dist
+          shopt -s nullglob
+          for apk in app/build/outputs/apk/*/release/*.apk; do
+            flavor="$(basename "$(dirname "$(dirname "$apk")")")"
+            ver="$("$BT/aapt" dump badging "$apk" | sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" | head -1)"
+            [ -n "$ver" ] || ver="unknown"
+            # lite -> IRIDIS-2.1.8.apk; full -> IRIDIS-2.1.8-full.apk（versionName 自带后缀）
+            out="dist/IRIDIS-${ver}.apk"
+            cp "$apk" "$out"
+            size="$(du -h "$out" | cut -f1)"
+            echo "- \`IRIDIS-${ver}.apk\`（flavor: ${flavor}，${size}）" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if ! ls dist/*.apk > /dev/null 2>&1; then
+            echo "No APK produced" >&2
+            exit 1
+          fi
+          if [ "$SIGN_MODE" = "release" ]; then
+            note="正式密钥签名（secrets 已配置）"
+          else
+            note="CI debug 密钥签名（未配置 ANDROID_KEYSTORE_BASE64 等 secrets；可安装，但每次构建签名不同，不可覆盖安装）"
+          fi
+          {
+            echo ""
+            echo "## IRIDIS APK 构建结果"
+            echo ""
+            echo "- 签名：${note}"
+            echo "- 触发：${{ github.event_name }}（${GITHUB_REF_NAME}）"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          (cd dist && sha256sum *.apk > checksums.txt)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRIDIS-apk-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" --clobber dist/*.apk dist/checksums.txt
+          else
+            gh release create "$tag" --title "IRIDIS $tag" --generate-notes \
+              dist/*.apk dist/checksums.txt
+          fi
