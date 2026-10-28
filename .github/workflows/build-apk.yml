@@ -9,6 +9,14 @@ name: Build APK
 # 处理：full flavor 改走脚本自带的 --build-mnn 从源码重建（同 pinned commit + 补丁，
 # 约 15-30 分钟，产物 third_party/mnn 进 actions/cache，后续构建零成本）；
 # lite flavor 不链接 MNN（IRIS_MNN 仅 full 开启），冷缓存时直接剥离该下载块。
+#
+# 2026-10-28 修复 2（NDK 工具链对齐）：MNN 源码重建走 build-mnn-android.sh（硬要求 NDK
+# r30），但 app 侧 ndkVersion 默认 r27c。r30 编出的目标文件引用 libc++ 新符号
+# std::__ndk1::__hash_memory（NDK r28+ 才有），r27c 的 libc++_static.a 没有它，
+# 链接 libiris_mnn.so 报 undefined symbol。处理：用 app/build.gradle.kts 官方支持的
+# local.properties ndk.path 机制把 app native 构建也切到 r30，与 MNN 产物同工具链。
+# 缓存 key 同时升 v3：失败 run 里重建的 MNN 因 cache 精确命中未被回存，
+# v3 + restore-keys 让本轮重补 MNN 后的完整产物必定入缓存。
 
 on:
   workflow_dispatch:
@@ -48,12 +56,14 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Install SDK components (platform-35 / build-tools / NDK r27c+r30 / CMake / ninja)
+      # 只装 r30：app 侧经 local.properties 的 ndk.path 也用 r30（与 MNN 重建同工具链，
+      # 见文件头注释）；r27c 不再需要，若 ndk.path 机制失效会因缺 r27c 快速显式报错
+      - name: Install SDK components (platform-35 / build-tools / NDK r30 / CMake / ninja)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-35" "build-tools;35.0.0" \
-            "ndk;27.2.12479018" "ndk;30.0.16248370" "cmake;3.22.1" > /dev/null
+            "ndk;30.0.16248370" "cmake;3.22.1" > /dev/null
 
       - name: Cache pinned native deps (llama.cpp / MNN / QNN headers / sherpa AAR)
         uses: actions/cache@v4
@@ -61,7 +71,10 @@ jobs:
           path: |
             third_party
             app/libs
-          key: native-deps-${{ hashFiles('scripts/fetch-deps.sh') }}
+          # v3：旧缓存条目只有 llama.cpp/sherpa/QNN（失败 run 里重建的 MNN 因精确命中未回存）；
+          # 本轮 MNN 补齐后按 v3 key 回存。上游脚本变化时 restore-keys 自动复用最近的旧条目
+          key: native-deps-v3-${{ hashFiles('scripts/fetch-deps.sh') }}
+          restore-keys: native-deps-
 
       - name: Fetch pinned native deps (MNN source rebuild, upstream asset deleted)
         run: |
@@ -129,6 +142,13 @@ jobs:
             full) TASKS="assembleFullRelease" ;;
             *)    TASKS="assembleLiteRelease assembleFullRelease" ;;
           esac
+          # 工具链对齐（见文件头注释）：app native 也用 r30，与 MNN 重建产物同 libc++ ABI，
+          # 否则链接 libiris_mnn.so 时报 __hash_memory 未定义符号。
+          # ndk.path 是 app/build.gradle.kts 官方支持的机制（有则优先于 ndkVersion）
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          ndk.path=$ANDROID_HOME/ndk/30.0.16248370
+          EOF
           echo "Building: $TASKS"
           ./gradlew $TASKS --no-daemon \
             -x lintVitalLiteRelease -x lintVitalFullRelease
